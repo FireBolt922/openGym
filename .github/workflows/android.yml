@@ -1,0 +1,123 @@
+# The signed Android APK, built on GitHub — the same steps as `build:apk` in .gitlab-ci.yml:
+# the VITE_MOBILE bundle, `cap sync` into android/, `./gradlew assembleRelease`, then zipalign
+# and apksigner with the release key. Every run leaves the APK as a workflow artifact; a `v*`
+# tag also attaches it (and its .sha256) to a GitHub Release.
+#
+# Needs three repository secrets (Settings → Secrets and variables → Actions):
+#   ANDROID_KEYSTORE_B64       base64 of the release keystore (`base64 -i release.jks`)
+#   ANDROID_KEYSTORE_PASSWORD  the keystore (and key) password
+#   ANDROID_KEY_ALIAS          the key alias inside the keystore
+# KEEP THAT KEYSTORE: updates must be signed with the same key or Android refuses to
+# install them over an existing copy. Without the secrets a branch build produces an
+# UNSIGNED apk (cannot be installed); a tag build fails instead.
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'frontend/**'
+      - 'catalogue/media/**'
+      - 'scripts/catalogue/stage-media.mjs'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write   # gh release create on a tag
+    steps:
+      - uses: actions/checkout@v7
+      # node:22-alpine in web/Dockerfile and api/Dockerfile — CI must match production.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # capacitor.build.gradle compiles for Java 21.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+          cache-dependency-path: |
+            frontend/android/**/*.gradle
+            frontend/android/gradle/wrapper/gradle-wrapper.properties
+
+      - run: npm ci
+        working-directory: frontend
+      # The training logic decides what you lift next; don't ship an APK it fails on.
+      - run: npm test
+        working-directory: frontend
+      # VITE_MOBILE build + `cap sync` into android/. The mobile flavor talks to no backend
+      # unless paired; the 180 px exercise media from catalogue/media are packed into the app.
+      - run: npm run build:mobile
+        working-directory: frontend
+
+      - name: assembleRelease
+        working-directory: frontend/android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Align and sign
+        working-directory: frontend/android
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -eu
+          VER="$(node -p "require('../package.json').version")"
+          UNSIGNED=app/build/outputs/apk/release/app-release-unsigned.apk
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          OUT="$GITHUB_WORKSPACE/dist-apk"
+          mkdir -p "$OUT"
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            KS="$RUNNER_TEMP/release.jks"
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$KS"
+            "$BT/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+            "$BT/apksigner" sign \
+              --ks "$KS" \
+              --ks-pass "env:ANDROID_KEYSTORE_PASSWORD" \
+              --ks-key-alias "$ANDROID_KEY_ALIAS" \
+              --key-pass "env:ANDROID_KEYSTORE_PASSWORD" \
+              --out "$OUT/openGym-$VER.apk" aligned.apk
+            rm -f "$KS"
+            "$BT/apksigner" verify --print-certs "$OUT/openGym-$VER.apk"
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            # A release must never quietly ship an APK nobody can install.
+            echo "::error::$GITHUB_REF_NAME is a release tag but ANDROID_KEYSTORE_B64 is not set."
+            exit 1
+          else
+            echo "::warning::No signing key — producing an UNSIGNED apk (cannot be installed)."
+            "$BT/zipalign" -f -p 4 "$UNSIGNED" "$OUT/openGym-$VER-unsigned.apk"
+          fi
+          # Sideloading means no app store checked this file for you: publish the digest.
+          cd "$OUT"
+          for apk in openGym-*.apk; do sha256sum "$apk" > "$apk.sha256"; cat "$apk.sha256"; done
+          echo "APK_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openGym-apk-${{ env.APK_VERSION }}
+          path: dist-apk/*
+          retention-days: 30
+
+      - name: GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist-apk/* --clobber
